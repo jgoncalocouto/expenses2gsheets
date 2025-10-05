@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import urlencode
 from datetime import date, datetime
 from collections.abc import Mapping
 
@@ -10,7 +11,7 @@ import requests
 import streamlit as st
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow, InstalledAppFlow
 from oauthlib.oauth2.rfc6749.errors import MismatchingStateError
 
 # =========================================
@@ -23,9 +24,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-HOST = "127.0.0.1"
-PORT = 8081
-REDIRECT = f"http://{HOST}:{PORT}/"
+LOCAL_REDIRECT = "http://127.0.0.1:8081/"
 
 st.set_page_config(page_title="Expense Logger (OAuth)", layout="wide")
 st.title("Expense Logger - Per-User Google Login (OAuth)")
@@ -35,13 +34,13 @@ EXPECTED_HEADERS = [
     "amount", "category", "payment_method", "notes"
 ]
 
-# =========================================
-# SECRETS HELPERS
-# =========================================
-REQ_WEB_KEYS = [
-    "client_id", "client_secret", "auth_uri", "token_uri", "auth_provider_x509_cert_url",
-]
+REQ_WEB_KEYS = ["client_id","client_secret","auth_uri","token_uri","auth_provider_x509_cert_url"]
 
+
+
+# =========================================
+# Secrets helpers
+# =========================================
 def _copy_mapping_like(obj) -> dict:
     if isinstance(obj, Mapping):
         return {str(k): obj[k] for k in obj.keys()}
@@ -50,9 +49,23 @@ def _copy_mapping_like(obj) -> dict:
     except Exception:
         return {}
 
-def _load_web_from_secrets() -> dict:
+def _get_app_cfg() -> dict:
+    if "app" not in st.secrets:
+        st.error("Missing [app] in secrets")
+        st.stop()
+    app = _copy_mapping_like(st.secrets["app"])
+    if not app.get("spreadsheet_id") and not app.get("spreadsheet_name"):
+        st.error("Provide [app].spreadsheet_id OR [app].spreadsheet_name")
+        st.stop()
+    if not app.get("redirect_uri"):
+        st.error("Provide [app].redirect_uri (local: http://127.0.0.1:8081/ ; cloud: https://<yourapp>.streamlit.app)")
+        st.stop()
+    app.setdefault("worksheet_name", "Expenses")
+    return app
+
+def _load_web_cfg() -> dict:
     if "oauth_client" not in st.secrets:
-        st.error("Missing [oauth_client] in .streamlit/secrets.toml")
+        st.error("Missing [oauth_client] in secrets")
         st.stop()
     oc = st.secrets["oauth_client"]
     if isinstance(oc, Mapping) and "web" in oc:
@@ -60,79 +73,21 @@ def _load_web_from_secrets() -> dict:
     else:
         web = {k.split("web.", 1)[1]: v for k, v in oc.items()
                if isinstance(k, str) and k.startswith("web.")}
-    missing = [k for k in REQ_WEB_KEYS if k not in web]
-    if missing:
-        st.error("[oauth_client.web] missing keys: " + ", ".join(missing))
+    miss = [k for k in REQ_WEB_KEYS if k not in web]
+    if miss:
+        st.error("[oauth_client.web] missing keys: " + ", ".join(miss))
         st.stop()
     for k in REQ_WEB_KEYS:
         v = web[k]
         if not isinstance(v, str) or not v.strip():
-            st.error(f"oauth_client.web.{k} must be a non-empty string.")
+            st.error(f"oauth_client.web.{k} must be non-empty string")
             st.stop()
         web[k] = v.strip()
-    web["redirect_uris"] = [REDIRECT]
     return web
 
-def _get_app_cfg() -> dict:
-    if "app" not in st.secrets:
-        st.error("Missing [app] in .streamlit/secrets.toml")
-        st.stop()
-    app_cfg = _copy_mapping_like(st.secrets["app"])
-    if not app_cfg.get("spreadsheet_id") and not app_cfg.get("spreadsheet_name"):
-        st.error("Provide [app].spreadsheet_id OR [app].spreadsheet_name in secrets.toml")
-        st.stop()
-    app_cfg.setdefault("worksheet_name", "Expenses")
-    return app_cfg
-
 # =========================================
-# OAUTH (InstalledAppFlow on loopback)
+# Data helpers
 # =========================================
-def run_user_oauth() -> None:
-    if st.session_state.get("_auth_in_progress"):
-        st.warning("Authentication already in progress. If stuck, reload the page.")
-        return
-    st.session_state["_auth_in_progress"] = True
-    try:
-        web = _load_web_from_secrets()
-        client_config = {
-            "web": {
-                "client_id": web["client_id"],
-                "client_secret": web["client_secret"],
-                "auth_uri": web["auth_uri"],
-                "token_uri": web["token_uri"],
-                "auth_provider_x509_cert_url": web["auth_provider_x509_cert_url"],
-                "redirect_uris": web["redirect_uris"],
-            }
-        }
-        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-        try:
-            creds = flow.run_local_server(
-                host=HOST, port=PORT,
-                authorization_prompt_message="Opening browser for Google login...",
-                success_message="Authentication complete. You can close this tab.",
-                open_browser=True,
-            )
-        except MismatchingStateError:
-            st.error(
-                "Login failed due to a state mismatch.\n"
-                f"- Ensure ONLY {REDIRECT} is authorized in Google Cloud.\n"
-                "- Close previous consent tabs and try again (one click only).\n"
-                "- Use a private/incognito window.\n"
-                "- Make sure only one Streamlit tab is open."
-            )
-            return
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        st.session_state.creds = creds
-        st.session_state.user = get_userinfo(creds)
-    finally:
-        st.session_state["_auth_in_progress"] = False
-
-def ensure_fresh_credentials(creds: Credentials) -> Credentials:
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    return creds
-
 def get_userinfo(creds: Credentials) -> dict:
     r = requests.get(
         "https://www.googleapis.com/oauth2/v3/userinfo",
@@ -142,34 +97,6 @@ def get_userinfo(creds: Credentials) -> dict:
     r.raise_for_status()
     return r.json()
 
-def logout():
-    for k in ("creds", "user", "_auth_in_progress"):
-        st.session_state.pop(k, None)
-    st.success("Logged out. Refresh the page if needed.")
-
-# =========================================
-# AUTH UI
-# =========================================
-auth_col1, _ = st.columns([1, 3])
-with auth_col1:
-    if "creds" not in st.session_state:
-        if st.button("Sign in with Google", use_container_width=True):
-            run_user_oauth()
-            st.rerun()
-    else:
-        u = st.session_state.get("user", {})
-        st.success(f"Signed in as {u.get('name') or u.get('email')}")
-        if st.button("Log out", use_container_width=True):
-            logout()
-            st.rerun()
-
-if "creds" not in st.session_state:
-    st.info("Please sign in with Google to continue.")
-    st.stop()
-
-# =========================================
-# SHEET HELPERS
-# =========================================
 def ensure_headers(ws):
     try:
         first_row = ws.row_values(1)
@@ -182,15 +109,11 @@ def ensure_headers(ws):
         return
     ws.insert_row(EXPECTED_HEADERS, index=1)
 
-# =========================================
-# DATA LAYER
-# =========================================
 def get_gspread_client() -> gspread.Client:
     creds: Credentials = st.session_state.get("creds")
-    if not creds:
-        st.stop()
-    creds = ensure_fresh_credentials(creds)
-    st.session_state.creds = creds
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        st.session_state.creds = creds
     return gspread.authorize(creds)
 
 @st.cache_resource
@@ -198,7 +121,7 @@ def get_worksheet():
     app_cfg = _get_app_cfg()
     ws_name = app_cfg.get("worksheet_name", "Expenses")
     client = get_gspread_client()
-    if "spreadsheet_id" in app_cfg and app_cfg["spreadsheet_id"]:
+    if app_cfg.get("spreadsheet_id"):
         sh = client.open_by_key(app_cfg["spreadsheet_id"])
     else:
         sh = client.open(app_cfg["spreadsheet_name"])
@@ -316,7 +239,6 @@ def month_view(df: pd.DataFrame):
 
     if not month_df.empty:
         display_cols = ["date", "description", "amount", "payment_method"]
-        st.markdown("Expenses")
         st.dataframe(
             month_df[display_cols].sort_values(by=["date", "description"]),
             use_container_width=True, hide_index=True
@@ -325,7 +247,148 @@ def month_view(df: pd.DataFrame):
         st.info("No expenses found for the selected month.")
 
 # =========================================
-# MAIN
+# OAuth dual-mode
+# =========================================
+def is_local(uri: str) -> bool:
+    return uri.startswith("http://127.0.0.1") or uri.startswith("http://localhost")
+
+def login_local(client_config: dict, redirect_uri: str) -> Credentials | None:
+    # Uses loopback server; works locally, not on Streamlit Cloud
+    host = "127.0.0.1" if "127.0.0.1" in redirect_uri else "localhost"
+    try:
+        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+        port = int(redirect_uri.split(":")[-1].split("/")[0])
+        creds = flow.run_local_server(
+            host=host, port=port,
+            authorization_prompt_message="Opening browser for Google login...",
+            success_message="Authentication complete. You can close this tab.",
+            open_browser=True,
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return creds
+    except MismatchingStateError:
+        st.error("State mismatch. Close other tabs, use incognito, and try again.")
+        return None
+    except Exception as e:
+        # This is what happens on Streamlit Cloud (no browser available)
+        st.info("Falling back to web redirect sign-in for this environment.")
+        return None
+
+def begin_login_cloud(client_config: dict, redirect_uri: str):
+    flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    st.session_state["oauth_state"] = state
+    st.session_state["oauth_code_verifier"] = flow.code_verifier
+    st.session_state["oauth_redirect_uri"] = redirect_uri
+    st.session_state["oauth_client_config"] = client_config
+    st.link_button("Continue to Google", auth_url, use_container_width=True)
+
+def finish_login_cloud() -> Credentials | None:
+    params = st.query_params
+    if "code" not in params or "state" not in params:
+        return None
+    expected_state = st.session_state.get("oauth_state")
+    if not expected_state or params.get("state") != expected_state:
+        st.error("OAuth state mismatch. Try signing in again.")
+        return None
+
+    client_config = st.session_state.get("oauth_client_config")
+    redirect_uri = st.session_state.get("oauth_redirect_uri")
+    code_verifier = st.session_state.get("oauth_code_verifier")
+    if not all([client_config, redirect_uri, code_verifier]):
+        st.error("OAuth session data missing. Try signing in again.")
+        return None
+
+    flow = Flow.from_client_config(client_config, scopes=SCOPES, state=expected_state, redirect_uri=redirect_uri)
+    flow.code_verifier = code_verifier
+
+    # Rebuild the callback URL: redirect_uri + current query
+    q = urlencode(list((k, v) for k, vs in params.multi_items() for v in (vs if isinstance(vs, list) else [vs])))
+    authorization_response = f"{redirect_uri}?{q}"
+
+    try:
+        flow.fetch_token(authorization_response=authorization_response)
+    except Exception as e:
+        st.error(f"Failed to complete sign-in: {e}")
+        return None
+
+    creds = flow.credentials
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return creds
+
+def login_button_handler():
+    app_cfg = _get_app_cfg()
+    web = _load_web_cfg()
+    redirect_uri = app_cfg["redirect_uri"]
+
+    client_config = {
+        "web": {
+            "client_id": web["client_id"],
+            "client_secret": web["client_secret"],
+            "auth_uri": web["auth_uri"],
+            "token_uri": web["token_uri"],
+            "auth_provider_x509_cert_url": web["auth_provider_x509_cert_url"],
+            "redirect_uris": [redirect_uri],
+        }
+    }
+
+    if is_local(redirect_uri):
+        creds = login_local(client_config, redirect_uri)
+        if creds:
+            st.session_state.creds = creds
+            st.session_state.user = get_userinfo(creds)
+            st.rerun()
+        else:
+            # Fall back to cloud flow even if misconfigured local
+            begin_login_cloud(client_config, redirect_uri)
+    else:
+        # Cloud: first try to finish if we are on a callback
+        creds = finish_login_cloud()
+        if creds:
+            st.session_state.creds = creds
+            st.session_state.user = get_userinfo(creds)
+            st.rerun()
+        else:
+            begin_login_cloud(client_config, redirect_uri)
+
+# =========================================
+# Auth UI
+# =========================================
+auth_col1, _ = st.columns([1, 3])
+with auth_col1:
+    if "creds" not in st.session_state:
+        if st.button("Sign in with Google", use_container_width=True):
+            login_button_handler()
+    else:
+        u = st.session_state.get("user", {})
+        st.success(f"Signed in as {u.get('name') or u.get('email')}")
+        if st.button("Log out", use_container_width=True):
+            for k in ("creds", "user", "oauth_state","oauth_code_verifier","oauth_redirect_uri","oauth_client_config"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+# If not logged in and a cloud callback is present, auto-finish
+if "creds" not in st.session_state:
+    creds = finish_login_cloud()
+    if creds:
+        st.session_state.creds = creds
+        st.session_state.user = get_userinfo(creds)
+        st.rerun()
+
+if "creds" not in st.session_state:
+    st.info("Please sign in with Google to continue.")
+    st.stop()
+
+
+
+# =========================================
+# Main
 # =========================================
 if "creds" in st.session_state:
     st.caption(f"Signed in as: {st.session_state.get('user', {}).get('email')}")
