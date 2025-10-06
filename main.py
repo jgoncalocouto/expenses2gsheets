@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, urlunparse
 from datetime import date, datetime
 from collections.abc import Mapping
 
@@ -365,6 +365,20 @@ def login_button_handler():
             st.rerun()
         else:
             begin_login_cloud(client_config, redirect_uri)
+def _canonical_redirect_uri(uri: str) -> str:
+    if not isinstance(uri, str):
+        raise ValueError("redirect_uri entries must be strings")
+    cleaned = uri.strip()
+    if not cleaned:
+        raise ValueError("redirect_uri entries must be non-empty strings")
+
+    parsed = urlparse(cleaned)
+    if parsed.scheme == "https" and parsed.path in ("", "/"):
+        parsed = parsed._replace(path="")
+        cleaned = urlunparse(parsed)
+    return cleaned
+
+
 def _normalize_redirect_uri(val) -> str:
     """
     Accept a string or a list/tuple of strings and return a single redirect URI.
@@ -372,17 +386,18 @@ def _normalize_redirect_uri(val) -> str:
     return the first valid string.
     """
     if isinstance(val, (list, tuple)):
-        # Prefer a hosted streamlit.app URL if one exists
-        for v in val:
-            if isinstance(v, str) and "streamlit.app" in v:
-                return v.strip()
-        # else fall back to the first string-like
+        candidates = []
         for v in val:
             if isinstance(v, str) and v.strip():
-                return v.strip()
-        raise ValueError("redirect_uri list has no valid string entries")
+                candidates.append(_canonical_redirect_uri(v))
+        if not candidates:
+            raise ValueError("redirect_uri list has no valid string entries")
+        for v in candidates:
+            if "streamlit.app" in v:
+                return v
+        return candidates[0]
     if isinstance(val, str) and val.strip():
-        return val.strip()
+        return _canonical_redirect_uri(val)
     raise ValueError("redirect_uri must be a non-empty string (or list of strings)")
 
 
