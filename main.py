@@ -53,15 +53,24 @@ def _get_app_cfg() -> dict:
     if "app" not in st.secrets:
         st.error("Missing [app] in secrets")
         st.stop()
-    app = _copy_mapping_like(st.secrets["app"])
-    if not app.get("spreadsheet_id") and not app.get("spreadsheet_name"):
+    app_cfg = _copy_mapping_like(st.secrets["app"])
+    if not app_cfg.get("spreadsheet_id") and not app_cfg.get("spreadsheet_name"):
         st.error("Provide [app].spreadsheet_id OR [app].spreadsheet_name")
         st.stop()
-    if not app.get("redirect_uri"):
+
+    # NEW: normalize redirect_uri to a single string
+    if "redirect_uri" not in app_cfg:
         st.error("Provide [app].redirect_uri (local: http://127.0.0.1:8081/ ; cloud: https://<yourapp>.streamlit.app)")
         st.stop()
-    app.setdefault("worksheet_name", "Expenses")
-    return app
+    try:
+        app_cfg["redirect_uri"] = _normalize_redirect_uri(app_cfg["redirect_uri"])
+    except Exception as e:
+        st.error(f"Invalid [app].redirect_uri: {e}")
+        st.stop()
+
+    app_cfg.setdefault("worksheet_name", "Expenses")
+    return app_cfg
+
 
 def _load_web_cfg() -> dict:
     if "oauth_client" not in st.secrets:
@@ -356,6 +365,26 @@ def login_button_handler():
             st.rerun()
         else:
             begin_login_cloud(client_config, redirect_uri)
+def _normalize_redirect_uri(val) -> str:
+    """
+    Accept a string or a list/tuple of strings and return a single redirect URI.
+    Prefer the one that looks like a Streamlit Cloud URL if present; otherwise
+    return the first valid string.
+    """
+    if isinstance(val, (list, tuple)):
+        # Prefer a hosted streamlit.app URL if one exists
+        for v in val:
+            if isinstance(v, str) and "streamlit.app" in v:
+                return v.strip()
+        # else fall back to the first string-like
+        for v in val:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        raise ValueError("redirect_uri list has no valid string entries")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    raise ValueError("redirect_uri must be a non-empty string (or list of strings)")
+
 
 # =========================================
 # Auth UI
